@@ -1,0 +1,157 @@
+// ==== Heltec WiFi Lo-Ra 32 V3 — MASTER (Versión con Envío Definitivo) ====
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RadioLib.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <string.h>
+
+// --- Definiciones, Instancias y Funciones de Ayuda (sin cambios) ---
+static const int PIN_LORA_NSS  = 8, PIN_LORA_DIO1 = 14, PIN_LORA_RST  = 12, PIN_LORA_BUSY = 13;
+#define I2C_SDA   17
+#define I2C_SCL   18
+#define OLED_RST  21
+#define VEXT_CTRL 36
+#define UART0_RX 44
+#define UART0_TX 43
+SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
+Adafruit_SSD1306 oled(128, 64, &Wire, OLED_RST);
+static const float   FREQ_MHZ   = 915.0, BW_KHZ = 125.0;
+static const uint8_t SF         = 7, CR_DEN = 5;
+static const uint16_t PREAMBLE  = 10;
+static const uint8_t SYNC_MSB   = 0x12, CTRLBITS = 0x44;
+static const int8_t  TX_PWR     = 14, CURR_LIM   = 120;
+static const uint8_t MASTER_ID    = 1;
+static const uint8_t TARGET_NODE_ID = 20;
+static uint8_t lastHdr[16];
+static size_t  lastHdrLen = 0;
+volatile bool rxFlag=false;
+struct Seen { uint16_t key; uint32_t ts; }; static Seen seenBuf[128]; static uint8_t seenIdx = 0;
+void IRAM_ATTR onDio1(){ rxFlag=true; }
+void vextOn(){ pinMode(VEXT_CTRL,OUTPUT); digitalWrite(VEXT_CTRL,LOW); }
+int bars(float rssi){ int b=(int)round((rssi+120.0f)*(10.0f/90.0f)); return b<0?0:(b>10?10:b); }
+void drawBars(int x,int y,int b){ for(int i=0;i<10;i++){ int bx=x+i*7, by=y-i; if(i<b) oled.fillRect(bx,by,6,3,SSD1306_WHITE); else oled.drawRect(bx,by,6,3,SSD1306_WHITE);} }
+void showPkt(uint8_t src, uint32_t seq, float rssi, float snr, const String& note){ oled.clearDisplay(); oled.setTextSize(1); oled.setCursor(0,0); oled.println(F("MASTER RECEPTOR")); oled.setCursor(0,12); oled.print(F("src:")); oled.print(src); oled.setCursor(64,12);oled.print(F("seq:")); oled.println(seq); oled.setCursor(0,26); oled.print(F("RSSI: ")); oled.print(rssi,1); oled.println(F(" dBm")); oled.setCursor(0,38); oled.print(F("SNR : ")); oled.print(snr,1); oled.println(F(" dB")); oled.setCursor(0,50); oled.print(note); drawBars(92,62,bars(rssi)); oled.display(); }
+size_t findAsciiStart(const uint8_t* data, size_t len){ for(size_t i=0;i<len;i++){ int run=0; for(size_t j=i;j<len;j++){ uint8_t c=data[j]; if(c>=32&&c<=126) run++; else break; } if(run>=3) return i; } return 0; }
+String asciiFromRaw(const uint8_t* buf, size_t len){ size_t off = findAsciiStart(buf,len); String s; s.reserve(len-off); for(size_t i=off;i<len;i++){ char c=(buf[i]>=32&&buf[i]<=126)?(char)buf[i]:0; if(c) s+=c; } return s; }
+void saveReyaxHeader(const uint8_t* buf, size_t len){ size_t off = findAsciiStart(buf, len); if (off > 0 && off <= sizeof(lastHdr)) { memcpy(lastHdr, buf, off); lastHdrLen = off; } }
+bool parseMesh(const String& s, uint8_t& src, uint8_t& dst, uint8_t& ttl, uint32_t& seq, String& payload){ if(!s.startsWith("M,")) return false; int p1=s.indexOf(',',2), p2=s.indexOf(',',p1+1), p3=s.indexOf(',',p2+1), p4=s.indexOf(',',p3+1); if(p1<0||p2<0||p3<0||p4<0) return false; src=(uint8_t)s.substring(2,p1).toInt(); dst=(uint8_t)s.substring(p1+1,p2).toInt(); ttl=(uint8_t)s.substring(p2+1,p3).toInt(); seq=(uint32_t)s.substring(p3+1,p4).toInt(); payload=s.substring(p4+1); return true; }
+bool seenRecently(uint8_t src, uint32_t seq) { uint16_t k = ((uint16_t)src << 8) ^ (uint16_t)(seq & 0xFF); uint32_t now = millis(); for(auto &e:seenBuf) if(e.key==k&&(now-e.ts)<30000UL)return true; seenBuf[seenIdx]={k,now}; seenIdx=(seenIdx+1)&127; return false; }
+void radioInit(){SPI.begin(9,11,10,PIN_LORA_NSS);radio.setDio2AsRfSwitch(true);int st=radio.begin(FREQ_MHZ,BW_KHZ,SF,CR_DEN,SYNC_MSB,TX_PWR,CURR_LIM);if(st!=RADIOLIB_ERR_NONE)Serial0.printf("ERR begin=%d\r\n",st);radio.setSyncWord(SYNC_MSB,CTRLBITS);radio.setPreambleLength(PREAMBLE);radio.setCRC(true);radio.setDio1Action(onDio1);radio.startReceive();}
+
+// --- INICIO DE LA CORRECCIÓN DEFINITIVA ---
+void sendPacket(uint8_t destinationId, uint8_t sourceId, const String& payload_ascii) {
+  if (lastHdrLen == 0) {
+    Serial0.println("ERROR: Aún no se ha capturado un encabezado. No se puede enviar.");
+    return;
+  }
+
+  size_t payload_len = payload_ascii.length();
+  
+  // Usar un buffer estático y seguro
+  static uint8_t outBuf[256];
+  
+  // 1. Copiar el encabezado capturado como plantilla
+  memcpy(outBuf, lastHdr, lastHdrLen);
+
+  // 2. CORREGIR los bytes clave en el encabezado binario
+  // Esta es la corrección final. El sniffer nos demostró que la dirección del
+  // remitente estaba incorrecta. Ahora la establecemos explícitamente.
+  // Asumimos que el formato del encabezado es [?, ?, Destino, Remitente, ...]
+  if (lastHdrLen >= 4) {
+      outBuf[2] = destinationId;
+      outBuf[3] = sourceId;
+  }
+  
+  // 3. Copiar el payload de texto
+  memcpy(outBuf + lastHdrLen, payload_ascii.c_str(), payload_len);
+  
+  // 4. Transmitir el paquete completo
+  Serial0.printf("Enviando -> Dest: %u, Src: %u, Payload: '%s'\n", destinationId, sourceId, payload_ascii.c_str());
+  
+  int state = radio.transmit(outBuf, lastHdrLen + payload_len);
+
+  // Limpiar la bandera de interrupción y reiniciar la escucha para evitar ecos
+  rxFlag = false;
+  radio.startReceive();
+
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial0.printf("Error en transmisión, código: %d\r\n", state);
+  }
+}
+// --- FIN DE LA CORRECCIÓN DEFINITIVA ---
+
+void setup(){
+  Serial0.begin(115200, SERIAL_8N1, UART0_RX, UART0_TX);
+  delay(200); Serial0.println("\n[MASTER] Receptor Estable vFinal");
+  vextOn(); delay(15);
+  Wire.begin(I2C_SDA,I2C_SCL);
+  pinMode(OLED_RST,OUTPUT); digitalWrite(OLED_RST,LOW); delay(5); digitalWrite(OLED_RST,HIGH); delay(5);
+  if(!oled.begin(SSD1306_SWITCHCAPVCC,0x3C)) Serial0.println("ERR OLED");
+  oled.clearDisplay(); oled.setTextColor(SSD1306_WHITE); oled.setTextSize(2);
+  oled.setCursor(0,0); oled.println("RECEPTOR"); oled.display();
+  Serial0.println("Escribe 'LED1_ON' o 'LED1_OFF' para controlar el nodo.");
+  radioInit();
+}
+
+void loop(){
+  if(rxFlag){
+    rxFlag=false;
+    
+    size_t L = radio.getPacketLength(); if(L==0||L>255) L=255;
+    uint8_t raw[255];
+    int rs = radio.readData(raw, L);
+    radio.startReceive();
+
+    if(rs==RADIOLIB_ERR_NONE){
+      saveReyaxHeader(raw, L); 
+      float rssi=radio.getRSSI(), snr=radio.getSNR();
+      String s = asciiFromRaw(raw, L);
+      uint8_t src,dst,ttl; uint32_t seq; String pl;
+
+      if(parseMesh(s,src,dst,ttl,seq,pl) && !seenRecently(src,seq)){
+        if (src == MASTER_ID) return;
+
+        Serial0.printf("DATA,%u,%.1f,%.1f,%s\r\n", src,rssi,snr,pl.c_str());
+        
+        String note;
+        if (pl.startsWith("DATA,")) {
+            int firstComma = pl.indexOf(',');
+            int secondComma = pl.indexOf(',', firstComma + 1);
+            if (secondComma > firstComma) {
+                String val0 = pl.substring(firstComma + 1, secondComma);
+                String val1 = pl.substring(secondComma + 1);
+                note = "A0:" + val0 + " A1:" + val1;
+            } else { note = "Error en formato DATA"; }
+        } else { note = "Msg: " + pl; }
+        showPkt(src, seq, rssi, snr, note);
+
+        if (dst == MASTER_ID) {
+          String ackAscii = "M," + String(MASTER_ID) + "," + String(src) + ",1," + String(seq) + ",ACK";
+          sendPacket(src, MASTER_ID, ackAscii);
+        }
+      }
+    }
+  }
+
+  if (Serial0.available()) {
+    String cmd = Serial0.readStringUntil('\n');
+    cmd.trim();
+    String payload_cmd;
+    bool valid_cmd = false;
+
+    if (cmd.equalsIgnoreCase("LED1_ON")) {
+      payload_cmd = "LED1_ON";
+      valid_cmd = true;
+    } else if (cmd.equalsIgnoreCase("LED1_OFF")) {
+      payload_cmd = "LED1_OFF";
+      valid_cmd = true;
+    }
+
+    if (valid_cmd) {
+      String mesh_packet = "M," + String(MASTER_ID) + "," + String(TARGET_NODE_ID) + ",2,0," + payload_cmd;
+      sendPacket(TARGET_NODE_ID, MASTER_ID, mesh_packet);
+    }
+  }
+}

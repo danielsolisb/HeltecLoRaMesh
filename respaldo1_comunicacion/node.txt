@@ -1,33 +1,34 @@
-// ==== ATmega328P / Arduino UNO (UART0 D0/D1) + RYLR896 ====
-// D0 RX0 <= TX RYLR 3V3  |  D1 TX0 => RX RYLR 3V3 (divisor 4.7k/10k)
-// Sin logs por Serial. LEDs de estado incluidos.
+// ==== ATmega328P / Arduino UNO (UART0 D0/D1) + RYLR896 - CÓDIGO ORIGINAL PROBADO ====
+#include <Arduino.h>
 
-#define LORA      Serial
+#define LORA Serial
 const int PIN_LED_RED   = 4;
 const int PIN_LED_GREEN = 3;
 
-#define RY_BAUD   9600
+#ifndef NETWORK_ID
+#define NETWORK_ID 0
+#endif
+
+#define RY_BAUD 9600
 const uint8_t MY_ID     = 20;
 const uint8_t MASTER_ID = 1;
 
 // Timings
-const uint16_t CMD_GAP_MS     = 90;
-const uint16_t AT_TO_MS       = 900;
-const uint16_t SEND_TO_MS     = 1000;
-const uint32_t TX_PERIOD_MS   = 3000;
+const uint16_t CMD_GAP_MS    = 90;
+const uint16_t AT_TO_MS      = 900;
+const uint16_t SEND_TO_MS    = 1000;
+const uint32_t TX_PERIOD_MS  = 3000;
 
 // Conectividad
-const uint32_t RX_ALIVE_MS    = 12000;
-const uint32_t ACK_WAIT_MS    = 2000;
-const uint8_t  ACK_FAIL_THRESH= 3;
+const uint32_t RX_ALIVE_MS     = 12000;
+const uint32_t ACK_WAIT_MS     = 2000;
+const uint8_t  ACK_FAIL_THRESH = 3;
 
 // Estado
 uint32_t seq = 0, lastSeqTx = 0;
 unsigned long lastTx = 0, lastRxMs = 0, ackDeadline = 0;
 bool cfg_ok=false, waitingAck=false;
 uint8_t ackFailStreak=0;
-
-// Rojo parpadeo no bloqueante
 bool redBlinkOn=false; unsigned long redBlinkT0=0;
 const uint16_t RED_ON_MS=120, RED_OFF_MS=880;
 
@@ -35,7 +36,6 @@ void ledBoth(bool on){ digitalWrite(PIN_LED_RED,on); digitalWrite(PIN_LED_GREEN,
 void blinkBoth(uint8_t n){ for(uint8_t i=0;i<n;i++){ ledBoth(true); delay(150); ledBoth(false); delay(150);} }
 void ticGreen(){ digitalWrite(PIN_LED_GREEN,1); delay(60); digitalWrite(PIN_LED_GREEN,0); }
 
-// UART helpers
 void clearInput(){ while (LORA.available()) (void)LORA.read(); }
 
 bool waitLine(String& out, unsigned long to=AT_TO_MS){
@@ -48,16 +48,6 @@ bool waitLine(String& out, unsigned long to=AT_TO_MS){
     }
   }
   return out.length()>0;
-}
-
-// -------------------- Mesh helpers --------------------
-struct Seen { uint16_t key; unsigned long ms; };
-Seen seenBuf[64]; uint8_t seenIdx=0;
-bool seenRecently(uint8_t src, uint32_t s){
-  uint16_t k=((uint16_t)src<<8) ^ (uint16_t)(s & 0xFF);
-  unsigned long now=millis();
-  for(auto &e: seenBuf) if(e.key==k && (now-e.ms)<30000UL) return true;
-  seenBuf[seenIdx]={k,now}; seenIdx=(seenIdx+1)&63; return false;
 }
 
 bool parseRCV(const String& line, String& outData, int& rssi, int& snr){
@@ -81,16 +71,12 @@ bool parseMesh(const String& s, uint8_t& src,uint8_t& dst,uint8_t& ttl,uint32_t&
   return true;
 }
 
-// ---- Manejo de +RCV cuando esperamos ACK (se usa dentro y fuera de sendAT) ----
 void handleRCVForAck(const String& line){
   String data; int rssi=0, snr=0;
   if(!parseRCV(line, data, rssi, snr)) return;
-
-  lastRxMs = millis(); // actividad RX
-
+  lastRxMs = millis();
   uint8_t src,dst,ttl; uint32_t sq; String pl;
   if(!parseMesh(data, src, dst, ttl, sq, pl)) return;
-
   if(dst==MY_ID && waitingAck && sq==lastSeqTx && (pl.startsWith("ACK") || pl.startsWith("PONG"))){
     waitingAck=false;
     ackFailStreak=0;
@@ -98,15 +84,13 @@ void handleRCVForAck(const String& line){
   }
 }
 
-// -------------------- AT helpers (procesa +RCV mientras espera +OK) --------------------
 bool sendAT(const String& cmd, unsigned long to=AT_TO_MS){
   clearInput();
   LORA.print(cmd); LORA.print("\r\n");
   String line; bool ok=false; unsigned long t0=millis();
-
   while (millis()-t0 < to){
     if (waitLine(line, to)){
-      if (line.startsWith("+RCV=")){        // <-- ¡no perdemos ACKs!
+      if (line.startsWith("+RCV=")){
         handleRCVForAck(line);
         continue;
       }
@@ -117,7 +101,6 @@ bool sendAT(const String& cmd, unsigned long to=AT_TO_MS){
   return ok;
 }
 
-// -------------------- AUTObaud & Config --------------------
 bool autobaud_fix_9600(){
   const long BAUDS[] = {115200,57600,38400,19200,9600};
   for (unsigned i=0;i<sizeof(BAUDS)/sizeof(BAUDS[0]);i++){
@@ -135,23 +118,20 @@ bool autobaud_fix_9600(){
   }
   return false;
 }
+
 bool cfgRYLR(){
   uint8_t tries=0; while(tries<3 && !sendAT("AT",600)){ tries++; delay(150); }
   if(tries>=3) return false;
   bool ok=true;
-  ok &= sendAT("AT+IPR=9600",800);          delay(CMD_GAP_MS);
-  ok &= sendAT("AT+BAND=915000000",800);    delay(CMD_GAP_MS);
+  ok &= sendAT("AT+IPR=9600",800); delay(CMD_GAP_MS);
+  ok &= sendAT("AT+BAND=915000000",800); delay(CMD_GAP_MS);
   ok &= sendAT("AT+PARAMETER=7,7,1,10",800);delay(CMD_GAP_MS);
-  ok &= sendAT("AT+NETWORKID=0",800);       delay(CMD_GAP_MS); // ajusta si usas sync privado
-  ok &= sendAT("AT+ADDRESS=20",800);        delay(CMD_GAP_MS);
-  ok &= sendAT("AT+CRFOP=14",800);          delay(CMD_GAP_MS);
-  (void)sendAT("AT+VER?",800);        delay(40);
-  (void)sendAT("AT+PARAMETER?",800);  delay(40);
-  (void)sendAT("AT+ADDRESS?",800);    delay(40);
+  ok &= sendAT(String("AT+NETWORKID=")+String(NETWORK_ID),800); delay(CMD_GAP_MS);
+  ok &= sendAT("AT+ADDRESS=20",800); delay(CMD_GAP_MS);
+  ok &= sendAT("AT+CRFOP=14",800); delay(CMD_GAP_MS);
   return ok;
 }
 
-// -------------------- Conectividad / LEDs --------------------
 inline bool meshAlive(){ return (millis()-lastRxMs) <= RX_ALIVE_MS; }
 void driveConnLED(){
   if(!cfg_ok) return;
@@ -167,7 +147,6 @@ void driveConnLED(){
   }
 }
 
-// -------------------- Setup / Loop --------------------
 void setup(){
   pinMode(PIN_LED_RED,OUTPUT);
   pinMode(PIN_LED_GREEN,OUTPUT);
@@ -179,7 +158,6 @@ void setup(){
 }
 
 void loop(){
-  // TX periódico + ventana ACK
   if(millis()-lastTx > TX_PERIOD_MS){
     lastTx = millis();
     lastSeqTx = seq++;
@@ -190,20 +168,15 @@ void loop(){
     ticGreen();
   }
 
-  // RX normal (por si llega fuera de sendAT)
   while(LORA.available()){
     String line = LORA.readStringUntil('\n'); line.trim();
     if(!line.length()) continue;
-    if(line.startsWith("+RCV=")) handleRCVForAck(line); // registra ACK y actividad
-    // (El forward mesh lo puedes volver a añadir si te hace falta)
+    if(line.startsWith("+RCV=")) handleRCVForAck(line);
   }
 
-  // Timeout del ACK (no bloqueante)
   if(waitingAck && (long)(millis()-ackDeadline) >= 0){
     waitingAck=false;
-    if(++ackFailStreak >= ACK_FAIL_THRESH){
-      // Deja que meshAlive() caduque y el rojo parpadee
-    }
+    if(++ackFailStreak >= ACK_FAIL_THRESH){}
   }
 
   driveConnLED();

@@ -1,11 +1,13 @@
-// ==== Heltec WiFi LoRa 32 V3 — MASTER Mesh (OLED + Serial + forward) ====
+// ==== Heltec WiFi LoRa 32 V3 — MASTER Mesh (OLED + Serial + ACK con cabecera REYAX) ====
 // UART0 (GPIO44 RX, 43 TX) -> mismo COM del boot
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <RadioLib.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <string.h>   // memcpy
 
 // --- Pines SX1262 (Heltec V3) ---
 static const int PIN_LORA_NSS  = 8;
@@ -73,7 +75,7 @@ void showPkt(uint8_t src, uint32_t seq, float rssi, float snr, const String& not
   drawBars(92,62,bars(rssi)); oled.display();
 }
 
-// --- ASCII extractor (salta encabezado binario si lo hay) ---
+// ... (El resto de las funciones helpers no necesitan cambios) ...
 size_t findAsciiStart(const uint8_t* data, size_t len){
   for(size_t i=0;i<len;i++){
     int run=0; for(size_t j=i;j<len;j++){ uint8_t c=data[j]; if(c>=32 && c<=126) run++; else break; }
@@ -87,8 +89,15 @@ String asciiFromRaw(const uint8_t* buf, size_t len){
   for(size_t i=off;i<len;i++){ char c=(buf[i]>=32&&buf[i]<=126)?(char)buf[i]:0; if(c) s+=c; }
   return s;
 }
-
-// --- Parse "M,src,dst,ttl,seq,payload"
+static uint8_t lastHdr[16];
+static size_t  lastHdrLen = 0;
+void saveReyaxHeader(const uint8_t* buf, size_t len){
+  size_t off = findAsciiStart(buf, len);
+  if (off > 0 && off <= sizeof(lastHdr)) {
+    memcpy(lastHdr, buf, off);
+    lastHdrLen = off;
+  }
+}
 bool parseMesh(const String& s, uint8_t& src, uint8_t& dst, uint8_t& ttl, uint32_t& seq, String& payload){
   if(!s.startsWith("M,")) return false;
   int p1=s.indexOf(',',2), p2=s.indexOf(',',p1+1), p3=s.indexOf(',',p2+1), p4=s.indexOf(',',p3+1);
@@ -142,6 +151,8 @@ void loop(){
     radio.startReceive(); irqEn=true;
 
     if(rs==RADIOLIB_ERR_NONE){
+      saveReyaxHeader(raw, L);
+
       float rssi=radio.getRSSI(), snr=radio.getSNR();
       String s = asciiFromRaw(raw, L);
 
@@ -151,21 +162,46 @@ void loop(){
         Serial0.printf("MEAS,%u,%u,%u,%u,%.1f,%.1f,%lu,%s\r\n",
           src,dst,ttl,seq,rssi,snr,(unsigned long)millis(), pl.c_str());
 
-        // OLED
-        String note = String("from ")+String(src);
+        // --- MODIFICADO: Lógica para interpretar el payload y mostrar en OLED ---
+        String note;
+        if (pl.startsWith("DATA,")) {
+            // Es un paquete de datos del sensor
+            int firstComma = pl.indexOf(',');
+            int secondComma = pl.indexOf(',', firstComma + 1);
+            String val0 = pl.substring(firstComma + 1, secondComma);
+            String val1 = pl.substring(secondComma + 1);
+            note = "A0:" + val0 + " A1:" + val1;
+        } else {
+            // Es un ping u otro tipo de mensaje
+            note = "Ping from " + String(src);
+        }
         showPkt(src, seq, rssi, snr, note);
 
-        // Forward si no soy el destino
+        // Si el destino soy yo, respondo ACK al remitente con el mismo seq
+        if (dst == MASTER_ID) {
+          String ackAscii = "M," + String(MASTER_ID) + "," + String(src) + ",1," + String(seq) + ",ACK";
+
+          if (lastHdrLen > 0) {
+            uint8_t outBuf[160];
+            size_t n = 0;
+            memcpy(outBuf + n, lastHdr, lastHdrLen); n += lastHdrLen;
+            memcpy(outBuf + n, (const uint8_t*)ackAscii.c_str(), ackAscii.length()); n += ackAscii.length();
+            
+            int ts = radio.transmit(outBuf, n);
+            Serial0.printf("ACK_with_hdr len=%u rs=%d\r\n", (unsigned)n, ts);
+          } else {
+            int ts = radio.transmit(ackAscii);
+            Serial0.printf("ACK_plain rs=%d\r\n", ts);
+          }
+        }
+
+        // Forward si no soy el destino (mantén tu routing)
         if(dst!=MASTER_ID && ttl>0){
-          // decrementa ttl
           String fwd = "M,"+String(src)+","+String(dst)+","+String((uint8_t)(ttl-1))+","+String(seq)+","+pl;
           int ts = radio.transmit(fwd);
           Serial0.printf("FWD dst=%u ttl->%u rs=%d\r\n", dst, (uint8_t)(ttl-1), ts);
         }
-      } else {
-        // Si quieres ver lo que no parsea:
-        // Serial0.printf("RAW \"%s\"\r\n", s.c_str());
-      }
+      } 
     }
   }
 }
